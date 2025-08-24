@@ -27,6 +27,7 @@ target_link_libraries(controller_node
   yaml-cpp
 )
 
+
 install(TARGETS controller_node
   DESTINATION lib/${PROJECT_NAME}
 )
