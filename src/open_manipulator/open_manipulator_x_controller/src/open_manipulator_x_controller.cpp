@@ -49,7 +49,7 @@ constexpr int      DWELL_MS = 0;   // 멈칫 제거
 
 // ---------------- 기본 프로파일(모든 구간) ----------------
 constexpr uint32_t PROFILE_ACC_MAIN = 100;   // 부드러운 가속
-constexpr uint32_t PROFILE_VEL_MAIN = 240;   // 적당한 속도
+constexpr uint32_t PROFILE_VEL_MAIN = 270;   // 적당한 속도
 
 // ---------------- 보간(일반 구간) ----------------
 constexpr int      SMOOTH_STEPS     = 60;    // 분할 스텝 수 (부드러움 ↑)
