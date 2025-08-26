@@ -8,7 +8,7 @@ import re
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Bool
 
 try:
     import serial
@@ -16,44 +16,46 @@ try:
 except ImportError:
     serial = None  # pyserial 미설치 대비
 
+
 class UartMultiReceiver(Node):
     """
-    - UART에서 한 줄(line)씩 읽어서:
-      1) raw 문자열을 String 토픽으로 퍼블리시
-      2) 동일 라인을 float으로 변환 가능하면 Float32 토픽으로도 퍼블리시
-    - CSV처럼 보이면 디버그 로그에 파싱 결과 출력(옵션)
-    - 포트 오류 시 자동 재연결
-    - (NEW) 완료/상태 토픽 구독 → UART로 지정 페이로드 전송
-      * "vacuum off" 수신 시 '3' 전송
-      * 그 외 메시지는 기존 기본 페이로드(기본 '2') 전송
+    - UART에서 한 줄씩 읽어 String/Float32 퍼블리시
+    - /vacuum_cmd(True) 수신 → MCU로 '3' 전송 (집기/시작)
+    - /manipulator_done == "vacuum off" 수신 → MCU로 '3' 전송 (놓기/해제)
+    - /vacuum_cmd(False)는 전송 안 함(OFF는 "vacuum off" 타이밍에서 처리)
+    - MCU 개행: none|lf|crlf (기본 none; 1바이트만 보냄)
+    - 포트 오류 자동 재연결, 송신 디바운스
     """
 
     def __init__(self):
         super().__init__('uart_multi_receiver')
 
-        # --- ROS 파라미터 (런치/명령행에서 변경 가능)
-        self.declare_parameter('port', '/dev/ttyACM0')
+        # --- ROS Parameters (기본값을 코드에 고정적으로 둠)
+        self.declare_parameter('port', '/dev/ttyACM1')
         self.declare_parameter('baudrate', 115200)
-        self.declare_parameter('newline', '\n')              # 개행 기준(참고용)
-        self.declare_parameter('reconnect_sec', 3.0)         # 끊기면 재연결 주기
+        self.declare_parameter('reconnect_sec', 3.0)
         self.declare_parameter('publish_empty_lines', False)
 
         # 퍼블리시 관련
-        self.declare_parameter('topic_raw', 'nucleo_uart')   # 문자열 토픽
-        self.declare_parameter('csv_hint', True)             # CSV처럼 보이면 숫자 파싱해 로그
-        self.declare_parameter('enable_float', True)         # 숫자 1개면 Float32 퍼블리시
+        self.declare_parameter('topic_raw', 'nucleo_uart')
+        self.declare_parameter('csv_hint', True)
+        self.declare_parameter('enable_float', True)
         self.declare_parameter('topic_float', '/ultrasonic_distance')
 
-        # === 완료/상태 토픽 수신 → UART 송신
+        # 완료/상태 토픽
         self.declare_parameter('done_topic', '/manipulator_done')
-        self.declare_parameter('tx_on_done', True)           # 완료 수신 시 전송 여부
-        self.declare_parameter('tx_payload_on_done', '2')    # 기본 전송 페이로드
-        self.declare_parameter('tx_append_newline', True)    # \n 붙여 보낼지
 
-        # 파라미터 값 읽기
+        # Vacuum 제어 토픽
+        self.declare_parameter('vacuum_cmd_topic', '/vacuum_cmd')
+
+        # MCU 개행 요구: none | lf | crlf  (기본 none)
+        self.declare_parameter('tx_newline_mode', 'none')
+        self.declare_parameter('retry_on_fail', True)
+        self.declare_parameter('debounce_ms', 120)
+
+        # --- Load params
         self.port = self.get_parameter('port').get_parameter_value().string_value
-        self.baud = self.get_parameter('baudrate').get_parameter_value().integer_value
-        self.newline = self.get_parameter('newline').get_parameter_value().string_value
+        self.baud = int(self.get_parameter('baudrate').get_parameter_value().integer_value)
         self.reconnect_sec = float(self.get_parameter('reconnect_sec').get_parameter_value().double_value)
         self.publish_empty = self.get_parameter('publish_empty_lines').get_parameter_value().bool_value
 
@@ -61,40 +63,44 @@ class UartMultiReceiver(Node):
         self.csv_hint = self.get_parameter('csv_hint').get_parameter_value().bool_value
         self.enable_float = self.get_parameter('enable_float').get_parameter_value().bool_value
         self.topic_float = self.get_parameter('topic_float').get_parameter_value().string_value
-        
-        # 완료/상태 토픽 관련 파라미터
+
         self.done_topic = self.get_parameter('done_topic').get_parameter_value().string_value
-        self.tx_on_done = self.get_parameter('tx_on_done').get_parameter_value().bool_value
-        self.tx_payload_on_done = self.get_parameter('tx_payload_on_done').get_parameter_value().string_value
-        self.tx_append_newline = self.get_parameter('tx_append_newline').get_parameter_value().bool_value
+        self.vacuum_cmd_topic = self.get_parameter('vacuum_cmd_topic').get_parameter_value().string_value
+
+        self.tx_newline_mode = self.get_parameter('tx_newline_mode').get_parameter_value().string_value.lower()
+        self.retry_on_fail = self.get_parameter('retry_on_fail').get_parameter_value().bool_value
+        self.debounce_ms = int(self.get_parameter('debounce_ms').get_parameter_value().integer_value or 120)
 
         if serial is None:
-            self.get_logger().fatal('pyserial이 설치되지 않았습니다. `pip install pyserial` 후 다시 실행해주세요.')
+            self.get_logger().fatal('pyserial이 없습니다. `pip install pyserial` 후 실행하세요.')
             raise SystemExit(1)
 
-        # 퍼블리셔
+        # --- Publishers
         self.pub_raw = self.create_publisher(String, self.topic_raw, 10)
         self.pub_float = (self.create_publisher(Float32, self.topic_float, 10) if self.enable_float else None)
 
-        # 완료/상태 토픽 구독 → UART 전송 콜백
-        self.sub_done = self.create_subscription(
-            String, self.done_topic, self._on_done_msg, 10
-        )
+        # --- Subscribers
+        self.sub_done = self.create_subscription(String, self.done_topic, self._on_done_msg, 10)
+        self.sub_vac  = self.create_subscription(Bool,   self.vacuum_cmd_topic, self._on_vacuum_cmd, 10)
 
-        # 시리얼 스레드
+        # --- Serial thread
         self._ser: Optional['serial.Serial'] = None
         self._stop = threading.Event()
-        self._write_lock = threading.Lock()   # TX 보호용 락
+        self._write_lock = threading.Lock()
         self._th = threading.Thread(target=self._read_loop, daemon=True)
         self._th.start()
+
+        # Debounce
+        self._last_tx_ns = 0
 
         self.get_logger().info(
             f'UART Multi Receiver started: port={self.port}, baud={self.baud}, '
             f'raw_topic={self.topic_raw}, float_topic={self.topic_float if self.enable_float else "disabled"}, '
-            f'done_topic={self.done_topic}, tx_on_done={self.tx_on_done}'
+            f'done_topic={self.done_topic}, vacuum_cmd_topic={self.vacuum_cmd_topic}, '
+            f'newline_mode={self.tx_newline_mode}'
         )
 
-    # 안전 종료
+    # ---- Lifecycle
     def destroy_node(self):
         self._stop.set()
         try:
@@ -109,16 +115,11 @@ class UartMultiReceiver(Node):
             pass
         super().destroy_node()
 
-    # 포트 열기 (없으면 재시도)
+    # ---- Serial helpers
     def _open_serial(self) -> Optional['serial.Serial']:
         while not self._stop.is_set():
             try:
-                ser = serial.Serial(
-                    self.port,
-                    self.baud,
-                    timeout=1.0,        # 읽기 타임아웃
-                    write_timeout=1.0
-                )
+                ser = serial.Serial(self.port, self.baud, timeout=1.0, write_timeout=1.0)
                 self.get_logger().info(f'Connected to {self.port} @ {self.baud}')
                 return ser
             except Exception as e:
@@ -126,11 +127,84 @@ class UartMultiReceiver(Node):
                 time.sleep(self.reconnect_sec)
         return None
 
-    # CSV 힌트가 있으면 숫자 파싱 시도 (디버그용)
+    def _compose_payload(self, base: str) -> bytes:
+        mode = self.tx_newline_mode
+        if mode == 'lf':
+            base += '\n'
+        elif mode == 'crlf':
+            base += '\r\n'
+        return base.encode('utf-8')
+
+    def _debounced(self) -> bool:
+        now_ns = time.time_ns()
+        if self._last_tx_ns != 0 and (now_ns - self._last_tx_ns) < self.debounce_ms * 1_000_000:
+            return True
+        self._last_tx_ns = now_ns
+        return False
+
+    def _send_byte(self, ch: str, label: str):
+        if self._debounced():
+            self.get_logger().debug("debounced uart send")
+            return
+        payload = self._compose_payload(ch)
+        try:
+            with self._write_lock:
+                if self._ser is None or not self._ser.is_open:
+                    self._ser = self._open_serial()
+                    if self._ser is None:
+                        self.get_logger().error("UART 연결 실패")
+                        return
+                self._ser.reset_output_buffer()
+                n = self._ser.write(payload)
+                self._ser.flush()
+                if n != len(payload):
+                    self.get_logger().error(f"UART partial write: {n}/{len(payload)}")
+                self.get_logger().info(f"UART TX ({label}) -> {repr(payload)}")
+        except Exception as e:
+            self.get_logger().error(f"UART TX 실패: {e}")
+            if self.retry_on_fail:
+                time.sleep(0.05)
+                try:
+                    with self._write_lock:
+                        if self._ser is None or not self._ser.is_open:
+                            self._ser = self._open_serial()
+                            if self._ser is None:
+                                self.get_logger().error("재연결 실패(재시도 불가)")
+                                return
+                        n = self._ser.write(payload)
+                        self._ser.flush()
+                        if n == len(payload):
+                            self.get_logger().info("UART TX 재시도 성공")
+                        else:
+                            self.get_logger().error(f"UART TX 재시도 실패: {n}/{len(payload)}")
+                except Exception as e2:
+                    self.get_logger().error(f"UART TX 재시도 예외: {e2}")
+
+    # ---- ROS Callbacks
+    def _on_done_msg(self, msg: String):
+        """
+        C++ 컨트롤러가 4번째 스텝에서 퍼블리시하는 "vacuum off"를 잡아
+        MCU로 '3'을 전송(릴레이 토글 → OFF).
+        """
+        text = (msg.data or "").strip().lower()
+        if text == 'vacuum off':
+            self._send_byte('3', "OFF via done_topic")
+        else:
+            self.get_logger().debug(f"ignore done msg: '{msg.data}'")
+
+    def _on_vacuum_cmd(self, msg: Bool):
+        """
+        True일 때만 '3' 송신(집기/시작). False는 전송하지 않음.
+        OFF는 위의 "vacuum off" 시점에 처리.
+        """
+        if msg.data:
+            self._send_byte('3', "ON via vacuum_cmd")
+        else:
+            self.get_logger().info("vacuum_cmd False (no UART TX)")
+
+    # ---- Serial reading loop
     def _maybe_parse_csv(self, s: str) -> Optional[List[float]]:
-        if not self.csv_hint:
-            return None
-        if ',' not in s:
+        if not self.csv_hint or ',' not in s:
             return None
         try:
             vals = [float(x.strip()) for x in s.split(',') if x.strip() != '']
@@ -141,89 +215,47 @@ class UartMultiReceiver(Node):
     def _try_publish_float(self, s: str):
         if not self.enable_float or self.pub_float is None:
             return
-        # 1) 먼저 전체가 숫자인지 시도
         try:
             value = float(s.strip())
-            msg = Float32()
-            msg.data = value
+            msg = Float32(); msg.data = value
             self.pub_float.publish(msg)
             self.get_logger().info(f"Float32 publish: {value:.4f}")
             return
         except ValueError:
             pass
-
-        # 2) 문자열 내부에서 첫 번째 부동소수 추출 (예: "Distance: 12.34 cm")
         m = re.search(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', s)
         if m:
             try:
                 value = float(m.group(0))
-                msg = Float32()
-                msg.data = value
+                msg = Float32(); msg.data = value
                 self.pub_float.publish(msg)
                 self.get_logger().info(f"Float32 publish(extracted): {value:.4f}")
             except ValueError:
                 pass
 
-    # 완료/상태 토픽 콜백: UART로 페이로드 전송
-    def _on_done_msg(self, msg: String):
-        text = (msg.data or "").strip().lower()
-        # 오직 "vacuum off"만 처리, 나머지는 무시해서 '2'가 안 나가게 함
-        if text != 'vacuum off':
-            self.get_logger().debug(f"ignore done msg: '{msg.data}'")
-            return
-
-        payload = '3'
-        if self.tx_append_newline:
-            payload += '\n'
-
-        try:
-            with self._write_lock:
-                if self._ser is None or not self._ser.is_open:
-                    self._ser = self._open_serial()
-                    if self._ser is None:
-                        self.get_logger().error("UART 미연결 상태라 '3' 전송 실패")
-                        return
-                self._ser.write(payload.encode('utf-8'))
-                self.get_logger().info("UART TX (vacuum off): '3'")
-        except Exception as e:
-            self.get_logger().error(f"UART TX 실패: {e}")
-
-    # 읽기 스레드
     def _read_loop(self):
         while not self._stop.is_set():
             if self._ser is None or not self._ser.is_open:
                 self._ser = self._open_serial()
                 if self._ser is None:
-                    break  # 종료
-
+                    break
             try:
                 line = self._ser.readline()  # \n 기준
                 if not line:
                     continue
-
                 try:
                     data = line.decode(errors='ignore')
                 except Exception:
                     continue
-
-                # 개행 제거
                 data = data.replace('\r', '').replace('\n', '')
                 if not data and not self.publish_empty:
                     continue
-
-                # 1) raw 문자열 퍼블리시
-                msg = String()
-                msg.data = data
+                msg = String(); msg.data = data
                 self.pub_raw.publish(msg)
-
-                # 2) 숫자 1개면 Float32 퍼블리시
                 self._try_publish_float(data)
-
-                # 3) CSV 파싱 로그(선택)
                 parsed = self._maybe_parse_csv(data)
                 if parsed is not None:
                     self.get_logger().debug(f'CSV parsed: {parsed}')
-
             except (serial.SerialException, OSError) as e:
                 self.get_logger().error(f'시리얼 오류: {e}. 포트 재연결 시도...')
                 try:
