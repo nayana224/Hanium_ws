@@ -31,7 +31,7 @@ class UartMultiReceiver(Node):
         super().__init__('uart_multi_receiver')
 
         # --- ROS Parameters (기본값을 코드에 고정적으로 둠)
-        self.declare_parameter('port', '/dev/ttyACM1')
+        self.declare_parameter('port', '/dev/ttyACM0')
         self.declare_parameter('baudrate', 115200)
         self.declare_parameter('reconnect_sec', 3.0)
         self.declare_parameter('publish_empty_lines', False)
