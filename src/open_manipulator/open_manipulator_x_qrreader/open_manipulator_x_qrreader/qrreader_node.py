@@ -24,8 +24,8 @@ class QrReaderNode(Node):
     MODEL_FILENAME   = "/home/pyo/Downloads/best7.pt"
     CAMERA_INDEX     = 0
     CAMERA_FALLBACK  = 1
-    CAMERA_WIDTH     = 1080
-    CAMERA_HEIGHT    = 1080
+    CAMERA_WIDTH     = 640
+    CAMERA_HEIGHT    = 640
 
     YOLO_CONF_THR    = 0.5
     YOLO_IOU_THR     = 0.4

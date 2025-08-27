@@ -434,7 +434,7 @@ private:
     RCLCPP_INFO(get_logger(), "Dequeued '%s' -> executing sequence (queue size now=%zu)",
                 key.c_str(), queue_size_unsafe());
 
-    std::thread([this, seq = it->second]() {
+    std::thread([this, seq = it->second]() { // it: zone_
       bool ok = run_sequence_with_vacuum(seq);
       publish_done(ok);
       busy_ = false;
@@ -488,10 +488,11 @@ private:
       if (DWELL_MS > 0) std::this_thread::sleep_for(std::chrono::milliseconds(DWELL_MS));
     }
 
+    /*
     if (vac_state_on_.load()) {
       vacuum_off();
     }
-
+    */
     vac_lock_off_.store(false);
     
     RCLCPP_INFO(get_logger(), "Sequience Finished");
@@ -518,22 +519,21 @@ private:
   }
   void vacuum_off()
   {
-    // OFF로 전환, 그리고 락을 켜서 이후 ON을 차단
     vac_lock_off_.store(true);
     bool was_on = vac_state_on_.exchange(false);
 
-    // 상태가 변할 때만 퍼블리시(중복 방지)
     if (was_on) {
       std_msgs::msg::Bool m; m.data = false;
       vac_pub_->publish(m);
       std::this_thread::sleep_for(std::chrono::milliseconds(int(VAC_OFF_SETTLE_S * 1000)));
-    }
 
-    // ↓ 파이썬 노드가 기다리는 문자열 신호(필요 시 유지)
-    std_msgs::msg::String s;
-    s.data = "vacuum off";
-    done_pub_->publish(s);
+      // 상태가 실제로 OFF로 바뀐 경우에만 문자열 알림
+      std_msgs::msg::String s;
+      s.data = "vacuum off";
+      done_pub_->publish(s);
+    }
   }
+
 
   void publish_done(bool success) 
   {

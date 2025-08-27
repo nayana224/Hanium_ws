@@ -180,26 +180,20 @@ class UartMultiReceiver(Node):
                 except Exception as e2:
                     self.get_logger().error(f"UART TX 재시도 예외: {e2}")
 
-    # ---- ROS Callbacks
     def _on_done_msg(self, msg: String):
-        """
-        C++ 컨트롤러가 4번째 스텝에서 퍼블리시하는 "vacuum off"를 잡아
-        MCU로 '3'을 전송(릴레이 토글 → OFF).
-        """
         text = (msg.data or "").strip().lower()
-        if text == 'vacuum off':
+        # 부분 일치로도 안전하게 (C++이 "vacuum off (reason)"로 바뀌어도 대응 가능)
+        if "vacuum off" in text:
             self._send_byte('3', "OFF via done_topic")
         else:
             self.get_logger().debug(f"ignore done msg: '{msg.data}'")
 
     def _on_vacuum_cmd(self, msg: Bool):
-        """
-        True일 때만 '3' 송신(집기/시작). False는 전송하지 않음.
-        OFF는 위의 "vacuum off" 시점에 처리.
-        """
         if msg.data:
-            self._send_byte('3', "ON via vacuum_cmd")
+            # 공압 ON: MCU에 '2' 전송 (SET)
+            self._send_byte('2', "ON via vacuum_cmd")
         else:
+            # OFF는 done_topic 타이밍(놓을 때)에서만 처리
             self.get_logger().info("vacuum_cmd False (no UART TX)")
 
     # ---- Serial reading loop
